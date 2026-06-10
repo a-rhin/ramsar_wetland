@@ -1,0 +1,17 @@
+﻿__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.env
+
+# Output rasters (large, reproducible)
+outputs/*.tif
+
+# ArcGIS lock and scratch files
+*.sr.lock
+*.DESKTOP-*.lock
+*.lock
+
+# Claude Code IDE settings
+.claude/
