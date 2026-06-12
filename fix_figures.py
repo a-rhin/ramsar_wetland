@@ -1,326 +1,250 @@
-#!/usr/bin/env python3
-"""
-Targeted fix for three figures:
-  1. keta_multipanel.png      — 1991 blank panel; background bleed
-  2. keta_2035_vs_2025.png    — background bleed outside boundary
-  3. muni_2035_vs_2025.png    — background bleed outside boundary
-  4. keta_landscape_metrics.png — 2035 bar wrong colour
-"""
-import warnings
-warnings.filterwarnings('ignore')
-
+﻿import os
+os.environ["PYTHONUTF8"] = "1"
 import numpy as np
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.transform import array_bounds
+from rasterio.mask import mask as rio_mask
+from rasterio.io import MemoryFile
+from shapely.geometry import mapping
+import geopandas as gpd
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.colors import ListedColormap, BoundaryNorm
-import rasterio
-from rasterio.features import geometry_mask
-import geopandas as gpd
-from scipy.ndimage import label as ndlabel
+from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.ticker import MaxNLocator
+from docx import Document
+from docx.shared import Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from pathlib import Path
 
-plt.rcParams.update({
-    'font.family': 'DejaVu Sans',
-    'axes.titlesize': 11, 'axes.labelsize': 10,
-    'xtick.labelsize': 9,  'ytick.labelsize': 9,
-    'figure.dpi': 150,
-})
+try:
+    from matplotlib_scalebar.scalebar import ScaleBar
+    SCALEBAR = True
+except ImportError:
+    SCALEBAR = False
 
 BASE = Path("D:/ramsar_wetlands")
 OUT  = BASE / "outputs"
+DOCX = OUT / "wetland_degradation_report_FINAL_v3.docx"
 
-CNAMES = {1: 'Vegetation', 2: 'Water body', 3: 'Built up/Bareland'}
-COLORS = {'Vegetation': '#2e7d32', 'Water body': '#1565c0', 'Built up/Bareland': '#e65100'}
+COLORS = {"Vegetation": "#2d7d2d", "Water body": "#4a90d9", "Built up/Bareland": "#e07b39"}
+CMAP   = ListedColormap(["#2d7d2d", "#4a90d9", "#e07b39"])
 NORM   = BoundaryNorm([0.5, 1.5, 2.5, 3.5], 3)
+YEARS  = [1991, 2001, 2015, 2025]
 
+LM_DATA = {
+    "keta": {
+        "years": [1991, 2001, 2015, 2025, 2035],
+        "sdi":   [0.9301, 1.0183, 0.9809, 0.8378, 0.6752],
+        "Vegetation":        {"n_patches": [5189,  11221, 7420,  2626, 265],
+                              "LPI":       [57.65, 43.30, 48.30, 63.12, 73.80]},
+        "Water body":        {"n_patches": [1693,  3695,  936,   735,  205],
+                              "LPI":       [22.47, 16.26, 19.70, 19.87, 19.90]},
+        "Built up/Bareland": {"n_patches": [13954, 13037, 11757, 8864, 5844],
+                              "LPI":       [2.97,  4.73,  2.58,  0.67, 0.02]},
+    },
+    "muni": {
+        "years": [1991, 2001, 2015, 2025, 2035],
+        "sdi":   [0.7531, 0.7276, 0.6872, 0.7327, 0.7341],
+        "Vegetation":        {"n_patches": [602,  661,  817,  790,  931],
+                              "LPI":       [43.53, 37.74, 24.92, 38.05, 40.41]},
+        "Water body":        {"n_patches": [69,   30,   25,   29,   7],
+                              "LPI":       [1.07,  0.59,  0.76,  0.78, 0.77]},
+        "Built up/Bareland": {"n_patches": [423,  328,  493,  629,  257],
+                              "LPI":       [41.77, 51.49, 54.95, 48.72, 46.05]},
+    },
+}
 
-def make_cmap():
-    c = ListedColormap(['#2e7d32', '#1565c0', '#e65100'])
-    c.set_bad(color='white', alpha=1)
-    return c
-
-
-def to_masked(arr):
-    """Mask NaN and sub-class values so they render as white."""
-    return np.ma.masked_where(np.isnan(arr) | (arr < 0.5), arr)
-
-
-# ── raster loader (mirrors main.py logic) ──────────────────────────────────
-def load_raster(site, year, bnd_gdf=None):
-    p = BASE / f"data/{site}/rasters/{site}_classified_{year}.tif"
-    with rasterio.open(p) as src:
-        arr  = src.read(1).astype(np.float32)
-        meta = src.meta.copy()
-        tf   = src.transform
-        crs  = src.crs
-    meta['crs'] = crs
-    if int(arr.max()) <= 2:          # 0-indexed muni-style
-        if bnd_gdf is not None:
-            bnd = bnd_gdf.to_crs(crs)
-            geoms   = [g for g in bnd.geometry if g is not None]
-            in_bnd  = geometry_mask(geoms, transform=tf,
-                                    out_shape=arr.shape, invert=True)
-            result  = np.full(arr.shape, np.nan, dtype=np.float32)
-            result[in_bnd] = arr[in_bnd] + 1   # 0→1, 1→2, 2→3
-            return result, meta, tf
-        return np.where(arr > 0, arr + 1, np.nan).astype(np.float32), meta, tf
-    arr[arr == 0] = np.nan           # 1-indexed keta-style
-    return arr, meta, tf
-
-
-def load_boundary(site):
-    return gpd.read_file(BASE / f"data/{site}/area/{site}_boundary.shp")
-
-
-def load_pred_2035(site):
-    """Load the saved CA-Markov prediction GeoTIFF (values 1–3, 0=NoData)."""
-    with rasterio.open(OUT / f"{site}_predicted_2035.tif") as src:
-        arr = src.read(1).astype(np.float32)
-    arr[arr == 0] = np.nan
-    return arr
-
-
-# ── decorators ─────────────────────────────────────────────────────────────
-def add_north_arrow(ax):
-    ax.annotate('N', xy=(0.07, 0.97), xytext=(0.07, 0.90),
-                xycoords='axes fraction', textcoords='axes fraction',
-                ha='center', va='center', fontsize=9, fontweight='bold',
-                arrowprops=dict(arrowstyle='->', color='black', lw=1.5),
-                annotation_clip=False)
-
-
-def add_scale_bar(ax, pixel_m):
-    xlim, ylim = ax.get_xlim(), ax.get_ylim()
-    w_px = xlim[1] - xlim[0]
-    h_px = abs(ylim[1] - ylim[0])
-    extent_km = w_px * pixel_m / 1000
-    bar_km = 1
-    for v in [1, 2, 5, 10, 20, 50, 100]:
-        if v < extent_km * 0.25:
-            bar_km = v
-    bar_px = bar_km * 1000 / pixel_m
-    x0 = xlim[0] + w_px * 0.05
-    x1 = x0 + bar_px
-    y0 = min(ylim) + h_px * 0.05
-    tick = h_px * 0.01
-    ax.plot([x0, x1], [y0, y0], 'k-', lw=2, solid_capstyle='butt')
-    for xv in (x0, x1):
-        ax.plot([xv, xv], [y0 - tick, y0 + tick], 'k-', lw=1.5)
-    ax.text((x0 + x1) / 2, y0 + h_px * 0.025,
-            f'{bar_km} km', ha='center', va='bottom', fontsize=7)
-
-
-def overlay_boundary(ax, bnd_gdf, crs, tf):
-    try:
-        bnd = bnd_gdf.to_crs(crs)
-        for geom in bnd.geometry:
-            if geom is None:
-                continue
-            parts = list(geom.geoms) if hasattr(geom, 'geoms') else [geom]
-            for part in parts:
-                xy   = np.array(part.exterior.coords)
-                cols = (xy[:, 0] - tf.c) / tf.a
-                rows = (xy[:, 1] - tf.f) / tf.e
-                ax.plot(cols, rows, 'k-', lw=0.9, alpha=0.85)
-    except Exception as e:
-        print(f"    [WARN] boundary overlay: {e}")
-
-
-def pin_limits(ax, arr):
-    """Force axes to exactly the raster's pixel extent (y inverted for imshow)."""
-    ax.set_xlim(0, arr.shape[1])
-    ax.set_ylim(arr.shape[0], 0)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# FIX 1 — keta_multipanel.png
-# ═══════════════════════════════════════════════════════════════════════════
+# ── FIX 2: LANDSCAPE METRICS CHARTS ─────────────────────────────────────────
 print("=" * 60)
-print("FIX 1: keta_multipanel.png")
-print("=" * 60)
+print("FIX 2: Landscape metrics charts")
+for site in ["keta", "muni"]:
+    lm    = LM_DATA[site]
+    yrs   = lm["years"]
+    ylbls = [str(y) if y != 2035 else "2035(P)" for y in yrs]
+    sl    = "Keta Lagoon Complex" if site == "keta" else "Muni-Pomadze"
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.patch.set_facecolor("white")
+    bc = ["#2d6a2d"] * (len(yrs) - 1) + ["#1a4f1a"]
+    axes[0].bar(ylbls, lm["sdi"], color=bc, edgecolor="white")
+    axes[0].set_title("Shannon Diversity Index", fontweight="bold")
+    axes[0].set_xlabel("Year"); axes[0].set_ylabel("SDI")
+    for i, v in enumerate(lm["sdi"]):
+        axes[0].text(i, v + 0.003, f"{v:.3f}", ha="center", va="bottom", fontsize=10)
+    axes[0].tick_params(axis="both", labelsize=10)
+    axes[0].grid(axis="y", alpha=0.3)
+    for cls, color in COLORS.items():
+        axes[1].plot(ylbls, lm[cls]["n_patches"], marker="o", color=color, label=cls, lw=2)
+    axes[1].set_title("Number of Patches per Class", fontweight="bold")
+    axes[1].set_xlabel("Year"); axes[1].set_ylabel("Patch Count")
+    axes[1].legend(fontsize=10); axes[1].grid(alpha=0.3)
+    axes[1].tick_params(axis="both", labelsize=10)
+    for cls, color in COLORS.items():
+        axes[2].plot(ylbls, lm[cls]["LPI"], marker="s", color=color, label=cls, lw=2)
+    axes[2].set_title("Largest Patch Index (%)", fontweight="bold")
+    axes[2].set_xlabel("Year"); axes[2].set_ylabel("LPI (%)")
+    axes[2].legend(fontsize=10); axes[2].grid(alpha=0.3)
+    axes[2].tick_params(axis="both", labelsize=10)
+    fig.suptitle(f"{sl} -- Landscape Metrics", fontweight="bold", fontsize=12)
+    plt.tight_layout()
+    fp = OUT / f"{site}_landscape_metrics.png"
+    fig.savefig(fp, dpi=200, bbox_inches="tight"); plt.close(fig)
+    print(f"  {fp.name}: {fp.stat().st_size//1024} KB")
 
-site  = 'keta'
-bnd   = load_boundary(site)
-cmap  = make_cmap()
-YEARS = [1991, 2001, 2015, 2025]
-
-rasters, metas = {}, {}
-for year in YEARS:
-    arr, meta, tf = load_raster(site, year, bnd)
-    rasters[year] = arr
-    metas[year]   = (meta, tf)
-    print(f"  {year}: shape={arr.shape}, valid={int(np.sum(~np.isnan(arr))):,}")
-
-pred = load_pred_2035(site)
-rasters[2035] = pred
-metas[2035]   = metas[2025]   # same spatial reference as 2025
-
-map_data = [(y, rasters[y]) for y in [1991, 2001, 2015, 2025, 2035]]
-
-fig, axes = plt.subplots(1, 5, figsize=(25, 6))
-
-for ax, (year, arr) in zip(axes, map_data):
-    meta_yr, tf_yr = metas[year]
-    crs_yr = meta_yr.get('crs') or meta_yr['crs']
-    pixel_m = abs(tf_yr.a)
-
-    ax.imshow(to_masked(arr), cmap=cmap, norm=NORM, interpolation='nearest')
-    pin_limits(ax, arr)                            # ← pin BEFORE any overlay
-
-    title = f"{year}" + ("\n(Predicted)" if year == 2035 else "")
-    ax.set_title(title, fontweight='bold', fontsize=10, pad=3)
-    ax.axis('off')
-
-    overlay_boundary(ax, bnd, crs_yr, tf_yr)
-    pin_limits(ax, arr)                            # ← re-pin AFTER boundary
-
-    add_north_arrow(ax)
-    add_scale_bar(ax, pixel_m)
-
-patches = [mpatches.Patch(color=c, label=n) for n, c in COLORS.items()]
-fig.legend(handles=patches, loc='lower center', ncol=3, fontsize=10,
-           frameon=True, bbox_to_anchor=(0.5, -0.04), framealpha=0.9)
-fig.suptitle('Keta Lagoon Complex — LULC Maps (1991–2035)',
-             fontsize=13, fontweight='bold', y=1.01)
-plt.tight_layout(rect=[0, 0.07, 1, 1])
-
-fig.savefig(OUT / 'keta_multipanel.png', dpi=300, bbox_inches='tight')
-fig.savefig(OUT / 'keta_multipanel.pdf', bbox_inches='tight')
-plt.close(fig)
-print("  Saved: keta_multipanel.png + .pdf\n")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# FIX 2 — 2035 vs 2025 comparison (keta & muni)
-# ═══════════════════════════════════════════════════════════════════════════
-print("=" * 60)
-print("FIX 2: 2035 vs 2025 comparison maps")
-print("=" * 60)
-
-for site in ['keta', 'muni']:
-    site_label = 'Keta Lagoon Complex' if site == 'keta' else 'Muni-Pomadze'
-    bnd = load_boundary(site)
-    arr_2025, meta_2025, tf_2025 = load_raster(site, 2025, bnd)
-    pred                          = load_pred_2035(site)
-    crs_2025                      = meta_2025.get('crs') or meta_2025['crs']
-    pixel_m_2025                  = abs(tf_2025.a)
-    cmap = make_cmap()
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    for ax, data, title in zip(
-        axes,
-        [arr_2025, pred],
-        ['2025 (Classified)', '2035 (CA-Markov Predicted)']
-    ):
-        ax.imshow(to_masked(data), cmap=cmap, norm=NORM, interpolation='nearest')
-        pin_limits(ax, data)
-
-        ax.set_title(f'{site_label} — {title}', fontweight='bold', fontsize=12)
-        ax.axis('off')
-
-        overlay_boundary(ax, bnd, crs_2025, tf_2025)
-        pin_limits(ax, data)                       # ← re-pin after boundary
-
-        add_north_arrow(ax)
-        add_scale_bar(ax, pixel_m_2025)
-
-    patches = [mpatches.Patch(color=c, label=n) for n, c in COLORS.items()]
-    fig.legend(handles=patches, loc='lower center', ncol=3,
-               fontsize=10, frameon=True, bbox_to_anchor=(0.5, -0.01))
-    plt.tight_layout(rect=[0, 0.06, 1, 1])
-    fp = OUT / f"{site}_2035_vs_2025.png"
-    fig.savefig(fp, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Saved: {fp.name}")
-
+# ── FIX 1: MULTIPANEL MAPS ───────────────────────────────────────────────────
 print()
-
-# ═══════════════════════════════════════════════════════════════════════════
-# FIX 3 — keta_landscape_metrics.png (uniform bar colour)
-# ═══════════════════════════════════════════════════════════════════════════
 print("=" * 60)
-print("FIX 3: keta_landscape_metrics.png")
-print("=" * 60)
+print("FIX 1: Multipanel maps")
+TARGET_CRS = "EPSG:32630"
 
-site = 'keta'
-bnd  = load_boundary(site)
-
-def shannon_di(arr):
-    v = arr[~np.isnan(arr)].astype(int)
-    v = v[np.isin(v, [1, 2, 3])]
-    n = len(v)
-    if n == 0: return 0.0
-    s = 0.0
-    for c in [1, 2, 3]:
-        p = np.sum(v == c) / n
-        if p > 0: s -= p * np.log(p)
-    return s
-
-def patch_metrics(arr):
-    tot = int(np.sum(~np.isnan(arr)))
-    out = {}
-    for cls in [1, 2, 3]:
-        labeled, n_pat = ndlabel((arr == cls).astype(int))
-        if n_pat > 0:
-            sizes = [int(np.sum(labeled == p)) for p in range(1, n_pat + 1)]
-            lpi   = max(sizes) / tot * 100 if tot else 0.0
+def load_rst(site, year, tgt, bnd_gdf=None):
+    p = BASE / f"data/{site}/rasters/{site}_classified_{year}.tif"
+    if not p.exists(): return None, None, None
+    with rasterio.open(p) as src:
+        arr = src.read(1).astype(np.float32)
+        meta = src.meta.copy(); meta["crs"] = src.crs
+        sc = src.crs; stf = src.transform; sh, sw = src.height, src.width
+    if int(arr.max()) <= 2:
+        if bnd_gdf is not None:
+            try:
+                from rasterio.features import geometry_mask
+                b2 = bnd_gdf.to_crs(sc)
+                gs = [g for g in b2.geometry if g is not None]
+                ib = geometry_mask(gs, transform=stf, out_shape=arr.shape, invert=True)
+                rs = np.full(arr.shape, np.nan, dtype=np.float32)
+                rs[ib] = arr[ib] + 1; arr = rs
+            except Exception:
+                arr = np.where(arr > 0, arr + 1, np.nan).astype(np.float32)
         else:
-            lpi = 0.0
-        out[CNAMES[cls]] = {'n_patches': n_pat, 'LPI': round(lpi, 4)}
-    return out
+            arr = np.where(arr > 0, arr + 1, np.nan).astype(np.float32)
+    else:
+        arr[arr == 0] = np.nan
+    if str(sc) != tgt:
+        print(f"    Reproject {site} {year}: {sc} -> {tgt}")
+        nd = np.where(np.isnan(arr), 0, arr).astype(np.float32)
+        bds = array_bounds(sh, sw, stf)
+        dtf, dw, dh = calculate_default_transform(sc, tgt, sw, sh, *bds)
+        dst = np.zeros((dh, dw), dtype=np.float32)
+        reproject(source=nd, destination=dst, src_transform=stf, src_crs=sc,
+                  dst_transform=dtf, dst_crs=tgt, resampling=Resampling.nearest,
+                  src_nodata=0, dst_nodata=0)
+        arr = np.where(dst == 0, np.nan, dst); stf = dtf
+        meta.update({"crs": rasterio.CRS.from_string(tgt),
+                     "transform": dtf, "width": dw, "height": dh})
+    return arr, meta, stf
 
-LM = {}
-for year in [1991, 2001, 2015, 2025]:
-    arr, _, _ = load_raster(site, year, bnd)
-    LM[year]  = {'SDI': shannon_di(arr), 'frag': patch_metrics(arr)}
-    print(f"  {year}: SDI={LM[year]['SDI']:.4f}")
+def clip_bnd(arr, meta, bnd):
+    crs = meta["crs"]; b2 = bnd.to_crs(crs)
+    gs  = [mapping(g) for g in b2.geometry if g is not None]
+    nd  = np.where(np.isnan(arr), 0, arr).astype(np.float32)
+    mm  = meta.copy(); mm.update(dtype="float32", count=1, nodata=0)
+    with MemoryFile() as mf:
+        with mf.open(**mm) as ds: ds.write(nd, 1)
+        with mf.open() as ds: out, otf = rio_mask(ds, gs, crop=True, nodata=0)
+    cl = out[0].astype(float); cl[cl == 0] = np.nan
+    return cl, otf
 
-pred_keta   = load_pred_2035(site)
-LM[2035]    = {'SDI': shannon_di(pred_keta), 'frag': patch_metrics(pred_keta)}
-print(f"  2035: SDI={LM[2035]['SDI']:.4f}")
+def plot_panel(ax, data, ctf, title, sx=True, sy=True):
+    mk = np.ma.masked_invalid(data)
+    h, w = data.shape
+    l, b, r, t = array_bounds(h, w, ctf)
+    ax.set_facecolor("white")
+    ax.imshow(mk, cmap=CMAP, norm=NORM, interpolation="nearest",
+              extent=[l, r, b, t], origin="upper")
+    if title: ax.set_title(title, fontsize=13, fontweight="bold", pad=5)
+    ax.axis("on")
+    ax.grid(True, linewidth=0.4, color="gray", alpha=0.4, linestyle="--")
+    ax.tick_params(axis="both", labelsize=9); ax.tick_params(axis="x", rotation=45)
+    ax.ticklabel_format(style="plain", axis="both")
+    ax.xaxis.set_major_locator(MaxNLocator(4)); ax.yaxis.set_major_locator(MaxNLocator(5))
+    ax.set_xlabel("Easting (m)" if sx else "", fontsize=9)
+    ax.set_ylabel("Northing (m)" if sy else "", fontsize=9)
+    ax.annotate("N", xy=(0.97, 0.97), xytext=(0.97, 0.88),
+                xycoords="axes fraction", fontsize=10, ha="right",
+                arrowprops=dict(arrowstyle="->", color="black", lw=1.5),
+                fontweight="bold", clip_on=False)
+    if SCALEBAR:
+        ax.add_artist(ScaleBar(1, units="m", location="lower left",
+                               font_properties={"size": 8}, frameon=True,
+                               color="black", box_alpha=0.7))
+    return (l, b, r, t)
 
-yr_list  = sorted(LM.keys())
-sdi_vals = [LM[y]['SDI'] for y in yr_list]
+for site in ["keta", "muni"]:
+    sl = "Keta Lagoon Complex" if site == "keta" else "Muni-Pomadze"
+    print(f"  {site.upper()}...")
+    bp = BASE / f"data/{site}/area/{site}_boundary.shp"
+    if not bp.exists(): bp = BASE / f"data/{site}/{site}_boundary.shp"
+    bnd = gpd.read_file(bp) if bp.exists() else None
+    fig, axes = plt.subplots(2, 2, figsize=(12, 11))
+    fig.patch.set_facecolor("white")
+    plt.subplots_adjust(left=0.08, right=0.97, top=0.93, bottom=0.10,
+                        wspace=0.18, hspace=0.25)
+    exts = []
+    for idx, (ax, yr) in enumerate(zip(axes.flatten(), YEARS)):
+        row, col = divmod(idx, 2)
+        res = load_rst(site, yr, TARGET_CRS, bnd)
+        if res[0] is None: ax.axis("off"); continue
+        arr, meta, tf = res
+        cl, ctf = clip_bnd(arr, meta, bnd) if bnd is not None else (arr, tf)
+        ext = plot_panel(ax, cl, ctf, str(yr), sx=(row == 1), sy=(col == 0))
+        exts.append(ext)
+    if exts:
+        gl = min(e[0] for e in exts); gb = min(e[1] for e in exts)
+        gr = max(e[2] for e in exts); gt = max(e[3] for e in exts)
+        for ax in axes.flatten():
+            if ax.has_data(): ax.set_xlim(gl, gr); ax.set_ylim(gb, gt)
+        print(f"    Extent x=[{gl:.0f},{gr:.0f}] y=[{gb:.0f},{gt:.0f}]")
+    patches = [mpatches.Patch(color=c, label=n) for n, c in COLORS.items()]
+    fig.legend(handles=patches, labels=list(COLORS.keys()),
+               loc="lower center", bbox_to_anchor=(0.5, 0.02),
+               ncol=3, fontsize=11, markerscale=1.5, frameon=True, edgecolor="gray")
+    fig.suptitle(f"{sl} -- LULC Maps (1991-2025)", fontsize=14, fontweight="bold", y=0.97)
+    fp = OUT / f"{site}_multipanel.png"
+    fig.savefig(fp, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"    Saved: {fp.name} ({fp.stat().st_size//1024} KB)")
 
-fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-
-# All bars the same green — no special 2035 colour
-GREEN = '#2d6a2d'
-axes[0].bar([str(y) for y in yr_list], sdi_vals, color=GREEN, edgecolor='white')
-axes[0].set_title('Shannon Diversity Index', fontweight='bold')
-axes[0].set_xlabel('Year'); axes[0].set_ylabel('SDI')
-for i, v in enumerate(sdi_vals):
-    axes[0].text(i, v + 0.003, f'{v:.3f}', ha='center', va='bottom', fontsize=8)
-axes[0].grid(axis='y', alpha=0.3)
-
-for ci, cls in enumerate(CNAMES.values()):
-    yrs  = [y for y in yr_list if cls in LM[y]['frag']]
-    vals = [LM[y]['frag'][cls]['n_patches'] for y in yrs]
-    axes[1].plot([str(y) for y in yrs], vals, marker='o',
-                 color=list(COLORS.values())[ci], label=cls, lw=2)
-axes[1].set_title('Number of Patches per Class', fontweight='bold')
-axes[1].set_xlabel('Year'); axes[1].set_ylabel('Patch Count')
-axes[1].legend(fontsize=8); axes[1].grid(alpha=0.3)
-
-for ci, cls in enumerate(CNAMES.values()):
-    yrs  = [y for y in yr_list if cls in LM[y]['frag']]
-    vals = [LM[y]['frag'][cls]['LPI'] for y in yrs]
-    axes[2].plot([str(y) for y in yrs], vals, marker='s',
-                 color=list(COLORS.values())[ci], label=cls, lw=2)
-axes[2].set_title('Largest Patch Index (%)', fontweight='bold')
-axes[2].set_xlabel('Year'); axes[2].set_ylabel('LPI (%)')
-axes[2].legend(fontsize=8); axes[2].grid(alpha=0.3)
-
-fig.suptitle('Keta Lagoon Complex — Landscape Metrics',
-             fontweight='bold', fontsize=12)
-plt.tight_layout()
-fp = OUT / 'keta_landscape_metrics.png'
-fig.savefig(fp, dpi=200, bbox_inches='tight')
-plt.close(fig)
-print(f"\n  Saved: {fp.name}")
-
-print("\n" + "=" * 60)
-print("All 3 figures fixed and saved.")
+# ── UPDATE DOCX ──────────────────────────────────────────────────────────────
+print()
 print("=" * 60)
+print("Updating FINAL_v3 docx...")
+BLIP = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
+doc  = Document(str(DOCX))
+
+def has_blip(p): return p._p.find(".//" + BLIP) is not None
+
+def replace_img(para, img_path, w=15.0):
+    pe = para._p
+    for c in list(pe): pe.remove(c)
+    from docx.text.paragraph import Paragraph as _P
+    rp = _P(pe, doc); run = rp.add_run()
+    run.add_picture(str(img_path), width=Cm(w))
+    rp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+TARGETS = [
+    ("Multi-temporal", "Keta Lagoon",     OUT / "keta_multipanel.png"),
+    ("Multi-temporal", "Muni-Pomadze",    OUT / "muni_multipanel.png"),
+    ("Landscape metrics", "Keta Lagoon",  OUT / "keta_landscape_metrics.png"),
+    ("Landscape metrics", "Muni-Pomadze", OUT / "muni_landscape_metrics.png"),
+]
+for kw1, kw2, img in TARGETS:
+    ps = doc.paragraphs
+    for i, p in enumerate(ps):
+        t = p.text
+        if kw1 in t and kw2 in t and "Figure:" in t and i > 0 and has_blip(ps[i-1]):
+            replace_img(ps[i-1], img)
+            print(f"  Replaced: {t[:55].encode('ascii','replace').decode()}")
+            break
+
+ps = doc.paragraphs
+for i, p in enumerate(ps):
+    t = p.text
+    if "Table 9b: Landscape metrics" in t or "Table 10b: Landscape metrics" in t:
+        if i > 0 and has_blip(ps[i-1]):
+            print(f"  Removing dup image before: {t[:50].encode('ascii','replace').decode()}")
+            ps[i-1]._p.getparent().remove(ps[i-1]._p)
+
+doc.save(str(DOCX))
+print(f"Saved: {DOCX.name} ({DOCX.stat().st_size/1024:.1f} KB)")
